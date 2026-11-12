@@ -5190,8 +5190,11 @@ OGR.noSW = true;
 
 /* js/ui/ocr.js */
 /* E+ · Kağıt liste fotoğrafından öğrenci listesi okuma.
-   Sağlayıcılar (sırayla): Claude görsel okuma (yalnızca Claude içinde yayınlanan sürümde) → tarayıcı TextDetector (varsa).
-   Çevrimdışı/kendi barındırılan sürümde bunlardan biri yoksa "desteklenmiyor" döner; elle/Excel aktarımı kullanılır. */
+   Sağlayıcılar (sırayla):
+   1) Claude görsel okuma (yalnızca Claude içinde yayınlanan sürümde),
+   2) Tesseract.js (Türkçe OCR; her yerde çalışır). Dosyalar önce vendor/tesseract/ klasöründen aranır (tam çevrimdışı kurulum),
+      yoksa ilk kullanımda jsDelivr'den indirilir ve önbelleğe alınır (ilk okuma için internet gerekir),
+   3) tarayıcı TextDetector (varsa; son çare). */
 (function () {
   'use strict';
   const OGR = (window.OGR = window.OGR || {});
@@ -5210,8 +5213,256 @@ OGR.noSW = true;
   // 'claude' | 'detector' | ''
   O.kind = async function () {
     if (await probe()) return 'claude';
-    if ('TextDetector' in window) return 'detector';
-    return '';
+    return 'tesseract';
+  };
+
+  const TV = '5.1.1', CV = '5.1.0';
+  const CDN = { script: `https://cdn.jsdelivr.net/npm/tesseract.js@${TV}/dist/tesseract.min.js`, worker: `https://cdn.jsdelivr.net/npm/tesseract.js@${TV}/dist/worker.min.js`, core: `https://cdn.jsdelivr.net/npm/tesseract.js-core@${CV}` };
+  const loadScript = (src) => new Promise((res, rej) => { const el = document.createElement('script'); el.src = src; el.onload = res; el.onerror = () => { el.remove(); rej(new Error('yüklenemedi')); }; document.head.appendChild(el); });
+  let tess = null; // {T, local}
+  async function loadTesseract() {
+    if (tess) return tess;
+    if (window.Tesseract) return (tess = { T: window.Tesseract, local: false });
+    try { await loadScript('vendor/tesseract/tesseract.min.js'); tess = { T: window.Tesseract, local: true }; }
+    catch (e) {
+      try { await loadScript(CDN.script); tess = { T: window.Tesseract, local: false }; }
+      catch (e2) { const er = new Error('OCR bileşeni yüklenemedi. İnternet bağlantınızı kontrol edin (ilk kullanımda indirilir) ya da Excel/CSV kullanın.'); er.code = 'offline'; throw er; }
+    }
+    if (!tess.T) throw new Error('OCR bileşeni başlatılamadı.');
+    return tess;
+  }
+
+  // OCR metnini öğrenci satırlarına çevirir. Biçimler: "12 Ayşe Yılmaz", "1 101 Ayşe Yılmaz" (sıra + okul no), "Yılmaz Ayşe" ayrımı yapılmaz (son sözcük soyad).
+  O.parseText = function (text) {
+    const rows = [];
+    for (let line of String(text || '').split(/\r?\n/)) {
+      line = line.replace(/[|_\[\]{}<>=~^*"“”]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!line) continue;
+      const toks = line.split(' ');
+      const nums = [];
+      while (toks.length && /^\d{1,7}[.)\-:,]?$/.test(toks[0])) nums.push(toks.shift().replace(/\D/g, ''));
+      const words = toks.map((w) => w.replace(/[^A-Za-zÇĞİIÖŞÜçğıöşüâîûÂÎÛ'’\-]/g, '')).filter((w) => w.replace(/[^A-Za-zÇĞİIÖŞÜçğıöşüâîûÂÎÛ]/g, '').length >= 2);
+      if (words.length < 2 || words.length > 5) continue;
+      // iki sayı varsa: ilki sıra no, ikincisi okul no; tek sayı: okul no (sıra no ise kullanıcı düzeltir)
+      const no = nums.length >= 2 ? nums[1] : nums[0] || '';
+      rows.push({ no, first: words.slice(0, -1).join(' '), last: words[words.length - 1] });
+    }
+    // Satırların çoğunda numara varsa numarasız satırlar başlıktır (ör. "Sınıf Listesi")
+    const withNo = rows.filter((r) => r.no).length;
+    if (withNo >= 3 && withNo >= rows.length * 0.6) { for (let i = rows.length - 1; i >= 0; i--) if (!rows[i].no) rows.splice(i, 1); }
+    // Yalnızca sıra numarası görünüyorsa (1,2,3… ardışık) okul no sayılmasın
+    const seq = rows.length > 2 && rows.every((r, i) => r.no === String(i + 1));
+    if (seq) rows.forEach((r) => (r.no = ''));
+    return rows;
+  };
+
+  // Gölgeli kağıt fotoğrafları için: gri tonlama → yerel (uyarlamalı) eşikleme → tablo çizgilerini silme.
+  function prep(canvas) {
+    const W = canvas.width, H = canvas.height;
+    const g = canvas.getContext('2d');
+    const img = g.getImageData(0, 0, W, H);
+    const px = img.data;
+    const gray = new Uint8Array(W * H);
+    for (let i = 0, j = 0; i < px.length; i += 4, j++) gray[j] = (px[i] * 0.299 + px[i + 1] * 0.587 + px[i + 2] * 0.114) | 0;
+    // integral görüntü
+    const ii = new Float64Array((W + 1) * (H + 1));
+    for (let y = 1; y <= H; y++) {
+      let row = 0;
+      for (let x = 1; x <= W; x++) { row += gray[(y - 1) * W + (x - 1)]; ii[y * (W + 1) + x] = ii[(y - 1) * (W + 1) + x] + row; }
+    }
+    const r = Math.max(12, Math.round(Math.min(W, H) / 40));
+    const bin = new Uint8Array(W * H); // 1 = mürekkep
+    for (let y = 0; y < H; y++) {
+      const y0 = Math.max(0, y - r), y1 = Math.min(H, y + r + 1);
+      for (let x = 0; x < W; x++) {
+        const x0 = Math.max(0, x - r), x1 = Math.min(W, x + r + 1);
+        const sum = ii[y1 * (W + 1) + x1] - ii[y0 * (W + 1) + x1] - ii[y1 * (W + 1) + x0] + ii[y0 * (W + 1) + x0];
+        const mean = sum / ((x1 - x0) * (y1 - y0));
+        bin[y * W + x] = gray[y * W + x] < mean * (O.TH || 0.86) ? 1 : 0;
+      }
+    }
+    // Perspektif/eğim düzeltme: yüksekliğe göre değişen yatay eğimi (satır izdüşümü keskinliğiyle) bulup görüntüyü kaydır
+    const nB = 5, xc = W / 2, cand = [];
+    for (let k = -12; k <= 12; k++) cand.push(k * 0.004);
+    const slopes = [];
+    for (let k = 0; k < nB; k++) {
+      const yc = (H * (k + 0.5)) / nB, hb = H / nB, ya = Math.max(0, Math.round(yc - hb)), yb = Math.min(H, Math.round(yc + hb));
+      let bestS = 0, bestV = -1;
+      for (const sl of cand) {
+        const acc = new Uint32Array(H + 2 * 200 + 2);
+        for (let y = ya; y < yb; y++) { const o = y * W; for (let x = 0; x < W; x += 3) if (bin[o + x]) { const yy = Math.round(y - sl * (x - xc)) + 200; if (yy >= 0 && yy < acc.length) acc[yy]++; } }
+        let v = 0; for (let i2 = 0; i2 < acc.length; i2++) v += acc[i2] * acc[i2];
+        if (v > bestV) { bestV = v; bestS = sl; }
+      }
+      slopes.push([yc, bestS]);
+    }
+    O._slopes = slopes;
+    const slopeAt = (y) => { if (y <= slopes[0][0]) return slopes[0][1]; for (let k = 1; k < nB; k++) if (y <= slopes[k][0]) { const t = (y - slopes[k - 1][0]) / (slopes[k][0] - slopes[k - 1][0]); return slopes[k - 1][1] * (1 - t) + slopes[k][1] * t; } return slopes[nB - 1][1]; };
+    const flat = new Uint8Array(W * H);
+    for (let y = 0; y < H; y++) { const sl = slopeAt(y); for (let x = 0; x < W; x++) { const sy = Math.round(y + sl * (x - xc)); if (sy >= 0 && sy < H) flat[y * W + x] = bin[sy * W + x]; } }
+    bin.set(flat);
+    // ince, uzun yatay çizgileri (tablo kuralları, noktalı olanlar dahil) sil; harf gövdeleri (üstünde/altında mürekkep olan pikseller) korunur
+    const minRun = O.RULES ? Math.round(W * 0.07) : 1e9; // çizgi silme varsayılan kapalı: deskew sonrası gerekmiyor, harf uçlarını yiyordu
+    const ink = (x, y) => y >= 0 && y < H && bin[y * W + x] === 1;
+    const kill = [];
+    for (let y = 0; y < H; y++) {
+      let x = 0;
+      while (x < W) {
+        if (!bin[y * W + x]) { x++; continue; }
+        let e = x, last = x;
+        while (e < W && e - last <= 3) { if (bin[y * W + e]) last = e; e++; }
+        if (last - x >= minRun) kill.push([x, last + 1, y]);
+        x = last + 1;
+      }
+    }
+    kill.forEach(([x0, x1, y]) => {
+      for (let x = x0; x < x1; x++) {
+        const top = ink(x, y - 4) || ink(x, y - 5), bot = ink(x, y + 4) || ink(x, y + 5);
+        if (!top && !bot) bin[y * W + x] = 0;
+      }
+    });
+    for (let i = 0, j = 0; i < px.length; i += 4, j++) { const v = bin[j] ? 0 : 255; px[i] = px[i + 1] = px[i + 2] = v; px[i + 3] = 255; }
+    g.putImageData(img, 0, 0);
+    canvas._bin = bin;
+    return canvas;
+  }
+  O._prep = prep;
+  O.REFINE = false; // sütun-sütun ikinci geçiş: yerel denemede ilk geçişten kötüydü, kapalı
+
+  // İki okumayı satır satır birleştirir: numara boşsa diğerinden, ad/soyad güveni yüksek olandan
+  O.merge = function (A, B) {
+    if (!A.length) return B; if (!B.length) return A;
+    const key = (r) => r.no;
+    let pairs;
+    if (A.length === B.length) pairs = A.map((a, i) => [a, B[i]]);
+    else { const mb = new Map(B.filter((r) => r.no).map((r) => [key(r), r])); pairs = A.map((a) => [a, a.no ? mb.get(a.no) : null]); }
+    const same = (a, b) => !b || !a || !a.no || !b.no || a.no === b.no || A.length !== B.length ? true : false;
+    return pairs.map(([a, b]) => {
+      if (!b) return a;
+      if (A.length === B.length && a.no && b.no && a.no !== b.no && !(a.first === b.first)) { /* hizalama kaymış olabilir: A'yı koru */ return a; }
+      const o = Object.assign({}, a);
+      if (!o.no && b.no) o.no = b.no;
+      else if (o.no && b.no && o.no !== b.no && b.no.endsWith(o.no)) o.no = b.no; // baştaki rakam düşmüş
+      const pick = (f, c) => { if (!a[f]) { o[f] = b[f]; o[c] = b[c]; } else if (b[f] && b[f] !== a[f] && (b[c] || 0) > (a[c] || 0) + 8) { o[f] = b[f]; o[c] = b[c]; } };
+      pick('first', 'fc'); pick('last', 'lc');
+      return o;
+    });
+  };
+
+  // Sözcük kutularından tablo okuma. words: [{text, x0, y0, x1, y1}]. Dönüş: [{no, first, last}]
+  O.parseWords = function (words, W) {
+    const LET = /[^A-Za-zÇĞİIÖŞÜçğıöşüâîûÂÎÛ'’\-]/g;
+    const ws = words.map((w) => ({ t: String(w.text || '').trim(), x0: w.x0, x1: w.x1, y0: w.y0, y1: w.y1, conf: w.conf })).filter((w) => w.t && w.x1 > w.x0)
+      .filter((w) => w.conf == null || (w.conf >= (/^\d+$/.test(w.t) ? 30 : 0) && (w.conf >= 50 || /^\d+$/.test(w.t) || w.t.replace(/[^A-Za-zÇĞİIÖŞÜçğıöşü]/g, '').length >= 3 || (w.conf >= 25 && w.t.replace(/[^A-Za-zÇĞİIÖŞÜçğıöşü]/g, '').length >= 1))))
+      .map((w) => Object.assign(w, { cx: (w.x0 + w.x1) / 2, cy: (w.y0 + w.y1) / 2, h: w.y1 - w.y0 }));
+    if (!ws.length) return [];
+    const isNum = (w) => /^\d{1,7}$/.test(w.t.replace(/[.,:;)]+$/, ''));
+    const nums = ws.filter(isNum);
+    const tol = W * 0.045;
+    // sayısal sütunları x'e göre kümele
+    const cols = [];
+    nums.slice().sort((a, b) => a.x0 - b.x0).forEach((w) => {
+      const c = cols.find((k) => Math.abs(k.x - w.x0) < tol || Math.abs(k.x1 - w.x1) < tol);
+      if (c) { c.items.push(w); c.x = c.items.reduce((s, i) => s + i.x0, 0) / c.items.length; c.x1 = c.items.reduce((s, i) => s + i.x1, 0) / c.items.length; } else cols.push({ x: w.x0, x1: w.x1, items: [w] });
+    });
+    const big = cols.filter((c) => c.items.length >= 3).sort((a, b) => a.x - b.x);
+    if (!big.length) return [];
+    const val = (w) => +w.t.replace(/\D/g, '');
+    const isSeq = (c) => { const v = c.items.slice().sort((a, b) => a.cy - b.cy).map(val); let ok = 0; for (let i = 1; i < v.length; i++) if (v[i] === v[i - 1] + 1) ok++; return v.length >= 3 && ok >= (v.length - 1) * 0.7; };
+    let seqCol = null, noCol = null;
+    if (isSeq(big[0])) { seqCol = big[0]; noCol = big[1] || null; } else noCol = big[0];
+    const anchorCol = seqCol || noCol;
+    const med = (a) => { const b = a.slice().sort((x, y) => x - y); return b.length ? b[b.length >> 1] : 0; };
+    let anchors = anchorCol.items.slice().sort((a, b) => a.cy - b.cy);
+    let pitch;
+    if (seqCol) {
+      // satır konumları ~ doğrusal: cy = a + b·değer (eksik okunan sıra numaraları için konum kestirimi)
+      const pts = anchors.map((w) => [val(w), w.cy]);
+      const n = pts.length, mx = pts.reduce((s2, p2) => s2 + p2[0], 0) / n, my = pts.reduce((s2, p2) => s2 + p2[1], 0) / n;
+      let sxx = 0, sxy = 0; pts.forEach(([x, y]) => { sxx += (x - mx) * (x - mx); sxy += (x - mx) * (y - my); });
+      const bb = sxx ? sxy / sxx : 0, aa = my - bb * mx;
+      const lo = Math.min.apply(null, pts.map((q) => q[0])), hi = Math.max.apply(null, pts.map((q) => q[0]));
+      const have = new Map(anchors.map((w) => [val(w), w]));
+      pitch = Math.abs(bb) || med(ws.map((w) => w.h)) * 1.6;
+      const first = Math.max(1, Math.min(lo, 1));
+      anchors = [];
+      for (let v = first; v <= hi; v++) anchors.push(have.get(v) || { t: String(v), cy: aa + bb * v, cx: seqCol.x, x0: seqCol.x, x1: seqCol.x1, synthetic: true });
+    } else {
+      const pitchs = []; for (let i = 1; i < anchors.length; i++) pitchs.push(anchors[i].cy - anchors[i - 1].cy);
+      pitch = med(pitchs) || med(ws.map((w) => w.h)) * 1.6;
+    }
+    const slope = 0;
+    // başlıktan Soyadı sütununun x'i
+    const hdr = ws.find((w) => /^soyad/i.test(w.t.replace(LET, '')) && w.cy < anchors[0].cy);
+    const soyX = hdr ? hdr.x0 - W * 0.04 : null;
+    const rows = anchors.map((a) => ({ a, words: [], no: '' }));
+    const numCands = nums.filter((w) => !anchorCol.items.includes(w));
+    const place = (w) => {
+      let best = null;
+      rows.forEach((r) => { const d = Math.abs(w.cy - r.a.cy); if (d < pitch * 0.55 && (!best || d < best.d)) best = { r, d }; });
+      return best && best.r;
+    };
+    ws.forEach((w) => {
+      if (anchorCol.items.includes(w)) return;
+      if (w.cy < anchors[0].cy - pitch * 0.6) return; // başlık/üst yazılar
+      if (w.x0 < anchorCol.x1 - tol * 0.5) return;
+      const r = place(w);
+      if (r) r.words.push(w);
+    });
+    const out = [];
+    const ext = { ad: [], so: [] };
+    // Ad sütununun sol kenarı (satırlardaki ilk metin sözcüklerinin ortancası) → solundaki çöpleri at
+    const isTxt = (w) => !isNum(w) && w.t.replace(/[^A-Za-zÇĞİIÖŞÜçğıöşüâîûÂÎÛ]/g, '').length >= 2;
+    const nameLeft = med(rows.map((r) => { const t = r.words.filter(isTxt); return t.length ? Math.min.apply(null, t.map((w) => w.x0)) : null; }).filter((x) => x != null).sort((a, b) => a - b)) || 0;
+    const allLetters = [].concat.apply([], rows.map((r) => r.words)).filter(isTxt).map((w) => w.t.replace(/[^A-Za-zÇĞİIÖŞÜçğıöşü]/g, ''));
+    const upperShare = allLetters.length ? allLetters.filter((t) => t === t.toLocaleUpperCase('tr')).length / allLetters.length : 0;
+    rows.forEach((r) => {
+      r.words = r.words.filter((w) => isNum(w) || (w.x0 >= nameLeft - W * 0.03 && !(upperShare >= 0.7 && w.t.replace(/[^A-Za-zÇĞİIÖŞÜçğıöşü]/g, '') === w.t.replace(/[^A-Za-zÇĞİIÖŞÜçğıöşü]/g, '').toLocaleLowerCase('tr'))));
+    });
+    // 1) satır başına: okul no + metin grupları (büyük boşlukla ayrılmış sözcük öbekleri = sütunlar)
+    const mhAll = med(ws.map((w) => w.h)) || 20;
+    const prepRow = (r) => {
+      const rowNums = r.words.filter(isNum).sort((a, b) => a.x0 - b.x0);
+      // Öğrenci No: 2. sayı sütunu (1. sütun S.No/sıra); tek sayı sütunu sıra numarası ise okul no yok
+      const own = noCol ? rowNums.filter((w) => w.x0 > (seqCol ? seqCol.x1 : 0) && w.x0 >= noCol.x - tol && w.x1 <= noCol.x1 + tol) : [];
+      r.no = !seqCol ? (noCol ? String(val(r.a)) : '') : noCol ? (own.length ? String(val(own[0])) : '') : '';
+      const LT1 = (w) => w.c.replace(/[^A-Za-zÇĞİIÖŞÜçğıöşüâîûÂÎÛ]/g, '').length;
+      const txt = r.words.filter((w) => !isNum(w)).map((w) => Object.assign({}, w, { c: w.t.replace(LET, '') })).filter((w) => LT1(w) >= 1).sort((a, b) => a.x0 - b.x0);
+      r.groups = [];
+      txt.forEach((w) => { const g = r.groups[r.groups.length - 1]; if (g && w.x0 - g.x1 <= mhAll * 2.2) { const prev = g.ws[g.ws.length - 1]; w.glue = w.x0 - prev.x1 < mhAll * 0.3 && (LT1(w) <= 2 || LT1(prev) <= 2); g.ws.push(w); g.x1 = w.x1; } else r.groups.push({ ws: [w], x0: w.x0, x1: w.x1 }); });
+      // tek başına duran 1 harflik parçalar (çizgi kalıntısı) atılır
+      r.groups = r.groups.filter((g) => g.ws.length > 1 || LT1(g.ws[0]) >= 2);
+      r.groups.forEach((g) => { g.text = g.ws.map((w, i) => (i && !w.glue ? ' ' : '') + w.c).join(''); });
+    };
+    rows.forEach(prepRow);
+    // 2) grupların sol kenarlarını sütunlara kümele; yalnızca ilk ikisi (Adı, Soyadı) kullanılır, sağdakiler (cinsiyet, pansiyon…) atılır
+    const xs = [].concat.apply([], rows.map((r) => r.groups.map((g) => g.x0))).sort((a, b) => a - b);
+    const cx = [];
+    xs.forEach((x) => { const c = cx[cx.length - 1]; if (c && x - c.max <= W * 0.035) { c.max = x; c.n++; c.sum += x; } else cx.push({ min: x, max: x, n: 1, sum: x }); });
+    const need = Math.max(3, rows.length * 0.3);
+    const tcols = cx.filter((c) => c.n >= need).slice(0, 2).map((c) => c.sum / c.n);
+    rows.forEach((r) => {
+      if (!r.groups.length) return;
+      let first = '', last = '', fc = 0, lc = 0;
+      const gc = (g) => g.ws.reduce((a, w) => a + (w.conf == null ? 60 : w.conf), 0) / g.ws.length;
+      const at = (g) => { let bi = 0, bd = 1e9; tcols.forEach((x, i) => { const d = Math.abs(g.x0 - x); if (d < bd) { bd = d; bi = i; } }); return bd <= W * 0.06 ? bi : -1; };
+      if (tcols.length >= 2) {
+        r.groups.forEach((g) => { const i = at(g); const t = g.text; if (i === 0) { first = (first + ' ' + t).trim(); fc = Math.max(fc, 0) + gc(g); } else if (i === 1) { last = (last + ' ' + t).trim(); lc = lc + gc(g); } });
+      } else {
+        const t = r.groups[0].ws; // tek "Ad Soyad" sütunu
+        if (t.length === 1) first = t[0].c; else { const ws2 = r.groups[0].text.split(' '); first = ws2.slice(0, -1).join(' '); last = ws2[ws2.length - 1]; }
+      }
+      if (!first && !last) return;
+      r.groups.forEach((g) => { const i = at(g); if (i === 0) ext.ad.push(...g.ws); else if (i === 1) ext.so.push(...g.ws); });
+      out.push({ no: r.no, first, last, fc: fc || gc(r.groups[0]), lc: lc || (last ? gc(r.groups[r.groups.length - 1]) : 0) });
+    });
+    const rg = (items) => items.length ? [Math.min.apply(null, items.map((w) => w.x0)), Math.max.apply(null, items.map((w) => w.x1))] : null;
+    const cl = [];
+    if (seqCol) cl.push([seqCol.x, seqCol.x1]);
+    if (noCol) cl.push([noCol.x, noCol.x1]);
+    [rg(ext.ad), rg(ext.so)].forEach((r2) => r2 && cl.push(r2));
+    out.meta = { pitch, y0: anchors[0].cy - pitch * 0.55, y1: anchors[anchors.length - 1].cy + pitch * 0.55, cols: cl.sort((a, b) => a[0] - b[0]) };
+    return out;
   };
 
   function shrink(file, max = 1800) {
@@ -5233,20 +5484,194 @@ OGR.noSW = true;
     });
   }
 
+
+  /* ---------- Sütun/satır bölütleme (tablo listeler için) ---------- */
+  const runs = (arr, minLen, maxGap) => {
+    const out = []; let st = -1, last = -1;
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i]) { if (st < 0) st = i; else if (i - last > maxGap) { out.push([st, last]); st = i; } last = i; }
+    }
+    if (st >= 0) out.push([st, last]);
+    return out.filter((r) => r[1] - r[0] + 1 >= minLen);
+  };
+  // İkili görüntüden tablo gövdesi + sütun aralıkları. Dönüş: {y0,y1,pitch,cols:[[x0,x1]…]} ya da null
+  O.segment = function (bin, W, H) {
+    const rowInk = new Uint32Array(H);
+    for (let y = 0; y < H; y++) { let c = 0; const o = y * W; for (let x = 0; x < W; x++) c += bin[o + x]; rowInk[y] = c; }
+    const lines = runs(Array.from(rowInk, (c) => (c > W * 0.006 ? 1 : 0)), 8, 2);
+    if (lines.length < 4) return null;
+    // düzenli aralıklı en uzun satır dizisi = tablo gövdesi
+    let best = [0, 0], i = 0;
+    while (i < lines.length - 1) {
+      let j = i; const pitch = lines[i + 1][0] - lines[i][0];
+      while (j + 1 < lines.length && Math.abs((lines[j + 1][0] - lines[j][0]) - pitch) <= pitch * 0.3) j++;
+      if (j - i > best[1] - best[0]) best = [i, j];
+      i = Math.max(j, i + 1);
+    }
+    if (best[1] - best[0] < 3) return null;
+    const first = lines[best[0]], last = lines[best[1]];
+    const pitch = (last[0] - first[0]) / (best[1] - best[0]);
+    const y0 = Math.max(0, Math.round(first[0] - pitch * 0.45)), y1 = Math.min(H - 1, Math.round(last[1] + pitch * 0.45));
+    const colInk = new Uint32Array(W);
+    for (let y = y0; y <= y1; y++) { const o = y * W; for (let x = 0; x < W; x++) colInk[x] += bin[o + x]; }
+    const cols = runs(Array.from(colInk, (c) => (c > 1 ? 1 : 0)), Math.round(W * 0.008), Math.round(W * 0.03));
+    if (cols.length < 2) return null;
+    return { y0, y1, pitch, cols };
+  };
+
+  // Sütun şeritlerinden gelen satırları tabloya çevirir. cols: [{x0,x1,lines:[{text,cy}],num:bool}]
+  O.parseColumns = function (cols, pitchHint) {
+    const med = (a) => { const b = a.slice().sort((x, y) => x - y); return b.length ? b[b.length >> 1] : 0; };
+    const LT = /[^A-Za-zÇĞİIÖŞÜçğıöşüâîûÂÎÛ'’ \-]/g;
+    const numCols = cols.filter((c) => c.num && c.lines.length >= 3), txtCols = cols.filter((c) => !c.num && c.lines.length >= 3);
+    if (!txtCols.length) return [];
+    const val = (l) => +String(l.text).replace(/\D/g, '');
+    const seqOf = (c) => { const v = c.lines.map(val); let ok = 0; for (let i = 1; i < v.length; i++) if (v[i] === v[i - 1] + 1) ok++; return v.length >= 3 && ok >= (v.length - 1) * 0.6; };
+    const seq = numCols.find(seqOf) || null;
+    const noCol = numCols.find((c) => c !== seq) || null;
+    let anchors, pitch = pitchHint || 0;
+    if (seq) {
+      const pts = seq.lines.map((l) => [val(l), l.cy]).filter((q) => q[0] > 0 && q[0] < 500);
+      const n = pts.length, mx = pts.reduce((a, q) => a + q[0], 0) / n, my = pts.reduce((a, q) => a + q[1], 0) / n;
+      let sxx = 0, sxy = 0; pts.forEach((q) => { sxx += (q[0] - mx) ** 2; sxy += (q[0] - mx) * (q[1] - my); });
+      const b = sxx ? sxy / sxx : pitch, a = my - b * mx;
+      pitch = Math.abs(b) || pitch;
+      const hi = Math.max.apply(null, pts.map((q) => q[0]));
+      anchors = []; for (let v = 1; v <= hi; v++) anchors.push({ cy: a + b * v });
+    } else {
+      const main = (noCol || txtCols.slice().sort((x, y) => y.lines.length - x.lines.length)[0]);
+      anchors = main.lines.map((l) => ({ cy: l.cy })).sort((x, y) => x.cy - y.cy);
+      const ps = []; for (let i = 1; i < anchors.length; i++) ps.push(anchors[i].cy - anchors[i - 1].cy);
+      pitch = med(ps) || pitch;
+    }
+    // her sütunun satırlarını en yakın çapaya ata; perspektif kaymasını doğrusal uydurmayla gider, yeniden ata
+    const assign = (col) => {
+      const near = (cy) => { let bi = -1, bd = 1e9; anchors.forEach((a, i) => { const d = Math.abs(cy - a.cy); if (d < bd) { bd = d; bi = i; } }); return [bi, bd]; };
+      let pts = col.lines.map((l) => { const [i, d] = near(l.cy); return d < pitch * 0.8 ? [anchors[i].cy, l.cy] : null; }).filter(Boolean);
+      let A = 0, B = 1;
+      if (pts.length >= 4) {
+        const mx = pts.reduce((a, q) => a + q[0], 0) / pts.length, my = pts.reduce((a, q) => a + q[1], 0) / pts.length;
+        let sxx = 0, sxy = 0; pts.forEach((q) => { sxx += (q[0] - mx) ** 2; sxy += (q[0] - mx) * (q[1] - my); });
+        B = sxx ? sxy / sxx : 1; A = my - B * mx;
+        if (B < 0.9 || B > 1.1) { B = 1; A = my - mx; }
+      }
+      const m = anchors.map(() => []);
+      col.lines.forEach((l) => { let bi = -1, bd = 1e9; anchors.forEach((a, i) => { const d = Math.abs(l.cy - (A + B * a.cy)); if (d < bd) { bd = d; bi = i; } }); if (bi >= 0 && bd < pitch * 0.6) m[bi].push(l); });
+      col.rows = m;
+    };
+    cols.forEach((c) => assign(c));
+    const pick = (col, a) => {
+      if (!col) return '';
+      return col.rows[anchors.indexOf(a)].sort((x, y) => x.cy - y.cy).map((l) => l.text).join(' ').trim();
+    };
+    const clean = (t) => { const w = t.replace(LT, ' ').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean); const keep = w.filter((x) => x.replace(/[^A-Za-zÇĞİIÖŞÜçğıöşü]/g, '').length >= 2); return (keep.length ? keep : w).join(' ').replace(/^[-'’ ]+|[-'’ ]+$/g, ''); };
+    const out = [];
+    anchors.forEach((a) => {
+      const parts = txtCols.map((c) => clean(pick(c, a)));
+      let first, last;
+      if (txtCols.length >= 2) { first = parts.slice(0, -1).filter(Boolean).join(' '); last = parts[parts.length - 1]; }
+      else { const w = parts[0].split(' ').filter(Boolean); if (w.length < 2) { first = w[0] || ''; last = ''; } else { first = w.slice(0, -1).join(' '); last = w[w.length - 1]; } }
+      if (!first && !last) return;
+      out.push({ no: noCol ? String(pick(noCol, a)).replace(/\D/g, '') : '', first, last });
+    });
+    return out;
+  };
+
+  // Tablo okuma hattı: bölütle → her sütunu ayrı OCR'la (rakam sütunu: yalnız rakam) → birleştir
+  async function readTable(worker, src, onProgress, meta) {
+    const W = src.width, H = src.height;
+    const seg = meta && meta.cols.length >= 2 ? { y0: Math.max(0, Math.round(meta.y0)), y1: Math.min(H - 1, Math.round(meta.y1)), pitch: meta.pitch, cols: meta.cols.map((c) => [Math.round(c[0]), Math.round(c[1])]) } : O.segment(src._bin, W, H);
+    if (!seg) return null;
+    const M = 24;
+    const strip = (x0, x1) => {
+      const cv = document.createElement('canvas');
+      const px0 = Math.max(0, x0 - 6), px1 = Math.min(W, x1 + 7);
+      cv.width = px1 - px0 + M * 2; cv.height = seg.y1 - seg.y0 + 1 + M * 2;
+      const g = cv.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, cv.width, cv.height);
+      g.drawImage(src, px0, seg.y0, px1 - px0, seg.y1 - seg.y0 + 1, M, M, px1 - px0, seg.y1 - seg.y0 + 1);
+      return cv;
+    };
+    const lineList = (d) => (d.lines || []).map((l) => ({ text: String(l.text || '').replace(/\s+/g, ' ').trim(), cy: (l.bbox.y0 + l.bbox.y1) / 2 - M + seg.y0, conf: l.confidence })).filter((l) => l.text);
+    const cols = [];
+    let k = 0;
+    for (const [x0, x1] of seg.cols) {
+      k++;
+      if (onProgress) onProgress('column ' + k + '/' + seg.cols.length, k / seg.cols.length);
+      const cv = strip(x0, x1);
+      await worker.setParameters({ tessedit_pageseg_mode: '6', tessedit_char_whitelist: '', preserve_interword_spaces: '1' });
+      let lines = lineList((await worker.recognize(cv)).data);
+      if (!lines.length) continue;
+      const digitShare = lines.filter((l) => /^[\d\s.,:;]+$/.test(l.text.replace(/[Oo]/g, '0'))).length / lines.length;
+      const num = digitShare >= 0.7;
+      const letters = lines.map((l) => l.text.replace(/[^A-Za-zÇĞİIÖŞÜçğıöşü]/g, '')).join('');
+      const upper = letters && letters === letters.toLocaleUpperCase('tr');
+      const WL = 'ABCÇDEFGĞHIİJKLMNOÖPRSŞTUÜVYZ' + (upper ? '' : 'abcçdefgğhıijklmnoöprsştuüvyz') + " .'-";
+      await worker.setParameters({ tessedit_pageseg_mode: '6', tessedit_char_whitelist: num ? '0123456789' : WL, preserve_interword_spaces: '1' });
+      const second = lineList((await worker.recognize(cv)).data);
+      if (second.length >= lines.length * 0.6) lines = second;
+      cols.push({ x0, x1, num, lines });
+    }
+    return O.parseColumns(cols, seg.pitch);
+  }
+
   // Dönüş: satır dizisi [{no, first, last}]
-  O.read = async function (file) {
+  O.read = async function (file, onProgress) {
     const kind = await O.kind();
-    if (!kind) { const e = new Error('Bu sürümde fotoğraftan okuma kullanılamıyor.'); e.code = 'unsupported'; throw e; }
-    const { blob, canvas } = await shrink(file);
+    const { blob, canvas } = await shrink(file, kind === 'claude' ? 1800 : 2200);
     if (kind === 'claude') {
-      const prompt = 'Ekteki fotoğraf, bir okul sınıfının kağıt öğrenci listesi (Türkçe). Listedeki her öğrenciyi oku. ' +
-        'Yalnızca şu biçimde bir JSON dizisi döndür: [{"no":"okul numarası ya da boş","first":"ad (birden çok adı varsa hepsi)","last":"soyad"}]. ' +
-        'Sıra numaralarını (1, 2, 3…) okul numarası sanma; yalnızca ayrı bir okul numarası sütunu varsa "no" doldur. ' +
-        'Başlıkları, imzaları, tarihleri ve öğretmen adını atla. Okuyamadığın veya emin olmadığın yeri uydurma: o öğrenciyi atla. Başka metin yazma.';
+      const prompt = 'Ekteki fotoğraf, bir okul sınıfının kağıt öğrenci listesi (Türkçe, tablo). Tablo sütunları soldan sağa şöyledir: "S.No" (sıra numarası), "Öğrenci No" (okul numarası), "Adı", "Soyadı". ' +
+        'Bunların dışındaki sütunları (cinsiyet, pansiyon durumu, sınıf, imza vb.) ve tablonun üstündeki başlık/öğretmen/tarih yazılarını TAMAMEN yok say. ' +
+        'Her tablo satırını yukarıdan aşağıya sırayla, hiçbir satırı atlamadan ve satırları birbirine karıştırmadan oku. "no" alanına S.No değil, "Öğrenci No" sütunundaki sayıyı yaz. ' +
+        'Adı sütunu birden çok sözcükse (ör. MUHAMMED ALİ) hepsini "first" içine yaz; Türkçe harfleri (İ, I, Ş, Ğ, Ü, Ö, Ç) doğru kullan. Okuyamadığın bir yeri uydurma. ' +
+        'Yalnızca şu biçimde bir JSON dizisi döndür, başka metin yazma: [{"no":"26","first":"FATMA","last":"GÜVERCİN"}]';
       const out = await sample.json(prompt, { images: [blob], modelTier: 'default', cache: false });
       const arr = Array.isArray(out) ? out : out && Array.isArray(out.students) ? out.students : [];
       return arr.map((x) => ({ no: String((x && x.no) || '').trim(), first: String((x && x.first) || '').trim(), last: String((x && x.last) || '').trim() })).filter((x) => x.first || x.last);
     }
+    if (kind === 'tesseract') {
+      let makeWorker = null;
+      try { await loadScript('vendor/ocr/eplus-ocr.js'); if (window.EPlusOCR) { await Promise.all(['tur.traineddata', 'tesseract-core-simd-lstm.wasm.js', 'tesseract-core-lstm.wasm.js'].map((f) => fetch('vendor/ocr/' + f).then((r) => { if (!r.ok) throw new Error('yok'); return r.arrayBuffer(); }).catch((e) => { if (f === 'tur.traineddata') throw e; }))); makeWorker = () => window.EPlusOCR.create('vendor/ocr/', onProgress); } } catch (e) { makeWorker = null; }
+      let T = null, local = false;
+      if (!makeWorker) ({ T, local } = await loadTesseract());
+      const opt = { logger: (m) => { if (onProgress && m && m.status) onProgress(m.status, m.progress || 0); } };
+      if (local) Object.assign(opt, { workerPath: 'vendor/tesseract/worker.min.js', corePath: 'vendor/tesseract/', langPath: 'vendor/tesseract/lang', gzip: false });
+      let worker;
+      try {
+        worker = makeWorker ? await makeWorker() : await T.createWorker('tur', 1, opt);
+        const toWords = (d) => (d.words || []).map((w) => ({ conf: w.confidence, text: w.text, x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1 }));
+        const score = (r) => r.length * 2 + r.filter((x) => x.no).length + r.filter((x) => x.first && x.last).length;
+        const onePass = async (th) => {
+          O.TH = th;
+          const c2 = document.createElement('canvas'); c2.width = canvas.width; c2.height = canvas.height;
+          c2.getContext('2d').drawImage(canvas, 0, 0);
+          const src = prep(c2);
+          let best = [];
+          for (const psm of ['11', '6']) {
+            await worker.setParameters({ tessedit_pageseg_mode: psm, preserve_interword_spaces: '1', tessedit_char_blacklist: '|[]{}<>_~^' });
+            const { data } = await worker.recognize(src);
+            let rows = O.parseWords(toWords(data), src.width);
+            if (rows.length < 3) rows = O.parseText(data.text);
+            if (score(rows) > score(best)) best = rows;
+            if (best.length >= 5 && best.every((x) => x.no)) break;
+          }
+          return best;
+        };
+        // iki farklı eşikle oku, satır satır güveni yüksek olanı al (numaralar koyu eşikte, adlar normalde daha iyi okunuyor)
+        const A = await onePass(0.86), B = await onePass(0.80);
+        const best = O.merge(A, B);
+        await worker.terminate();
+        return best;
+      } catch (e) {
+        try { worker && (await worker.terminate()); } catch (x) { /* yoksay */ }
+        if ('TextDetector' in window) return detect(canvas);
+        const er = new Error('Metin okunamadı: ' + ((e && e.message) || 'bilinmeyen hata') + ' · İnternet gerekebilir (Türkçe dil verisi ilk kullanımda indirilir).');
+        throw er;
+      }
+    }
+    return detect(canvas);
+  };
+  async function detect(canvas) {
+    if (!('TextDetector' in window)) throw new Error('Bu tarayıcı fotoğraftan okumayı desteklemiyor.');
     const det = new window.TextDetector();
     const found = await det.detect(canvas);
     found.sort((a, b) => a.boundingBox.y - b.boundingBox.y || a.boundingBox.x - b.boundingBox.x);
@@ -5260,7 +5685,7 @@ OGR.noSW = true;
       rows.push({ no: m[1] || '', first: words.slice(0, -1).join(' '), last: words[words.length - 1] });
     }
     return rows;
-  };
+  }
   OGR.ocr = O;
 })();
 
@@ -6577,14 +7002,15 @@ OGR.noSW = true;
         const box = mm.$('[data-photo]');
         if (!box) return;
         box.hidden = false;
-        if (!k) { mm.$('[data-pfile]').disabled = true; mm.$('[data-pnote]').textContent = 'Fotoğraftan okuma bu sürümde kullanılamıyor (Claude içinde yayınlanan sürümde veya desteklenen tarayıcıda çalışır). Excel/CSV kullanabilirsiniz.'; box.querySelector('label').classList.add('is-disabled'); return; }
         if (k === 'claude') mm.$('[data-pnote]').textContent = 'Fotoğraf, okunması için Claude’a gönderilir. Okunanları kaydetmeden önce kontrol edersiniz.';
+        else mm.$('[data-pnote]').textContent = 'Fotoğraf cihazınızda okunur (Türkçe OCR, internet gerekmez, fotoğraf hiçbir yere gönderilmez). Okunanları kaydetmeden önce kontrol edersiniz.';
         mm.$('[data-pfile]').addEventListener('change', async (e) => {
           const f = e.target.files[0];
           if (!f) return;
           const note = mm.$('[data-pnote]');
           note.textContent = 'Liste okunuyor… birkaç saniye sürebilir.';
-          try { photoCheck(mm, await OGR.ocr.read(f), f.name); }
+          const names = { 'loading tesseract core': 'Okuyucu hazırlanıyor…', 'initializing tesseract': 'Okuyucu hazırlanıyor…', 'loading language traineddata': 'Türkçe dil verisi indiriliyor…', 'initializing api': 'Okuyucu hazırlanıyor…', 'recognizing text': 'Liste okunuyor…' };
+          try { photoCheck(mm, await OGR.ocr.read(f, (st, pr) => { note.textContent = (names[st] || 'Liste okunuyor…') + (pr > 0 && pr < 1 ? ' %' + Math.round(pr * 100) : ''); }), f); }
           catch (x) { note.textContent = ''; mm.error((x && x.message) || 'Liste okunamadı.'); }
         });
       });
@@ -6594,11 +7020,12 @@ OGR.noSW = true;
       mm.$('[data-tpl]').onclick = () => OGR.export.save('\ufeffAd;Soyad;Okul No\r\nAyşe;Yılmaz;101\r\nMehmet;Kaya;102\r\n', 'ogrenci-sablon.csv', 'text/csv;charset=utf-8');
     }
     // Okunan listeyi düzenlenebilir metin olarak göster (No;Ad;Soyad), sonra mevcut aktarım adımına ver
-    function photoCheck(mm, list, fname) {
+    function photoCheck(mm, list, file) {
+      const imgUrl = file && file.type ? URL.createObjectURL(file) : '';
       if (!list.length) { step1(mm, 'Fotoğrafta öğrenci adı okunamadı. Daha net ve düz bir fotoğraf deneyin.'); return; }
       const text = list.map((x) => [x.no, x.first, x.last].join(';')).join('\n');
       mm.setBody(h`<div class="row"><b>Okunan liste</b><span class="pill" data-cnt>${list.length} öğrenci</span></div>
-        <p class="muted">Her satır: <b>numara;ad;soyad</b>. Yanlış okunanları düzeltin, fazlaları silin, eksikleri ekleyin.</p>
+        ${imgUrl ? h`<div class="photoref" style="max-height:34vh;overflow:auto;border:1px solid var(--line);border-radius:10px;margin:8px 0"><img src="${imgUrl}" alt="Çektiğiniz liste fotoğrafı" style="width:160%;max-width:none;display:block"></div>` : ''}<p class="muted">Her satır: <b>numara;ad;soyad</b>. Yanlış okunanları düzeltin, fazlaları silin, eksikleri ekleyin.</p>
         <textarea class="textarea" data-ptext spellcheck="false" style="min-height:260px;font-family:ui-monospace,monospace;font-size:14px" aria-label="Okunan öğrenci listesi">${text}</textarea>
         <p class="form-error" data-error role="alert"></p>
         <div class="row" style="justify-content:space-between"><button class="btn" data-back type="button">Geri</button><button class="btn btn-primary" data-pgo type="button">${icon('check')} Devam</button></div>`);
@@ -7026,7 +7453,7 @@ OGR.noSW = true;
   const A = OGR.auth;
   const V = OGR.views;
   const { h, raw, icon } = ui;
-  OGR.VERSION = '1.3.0';
+  OGR.VERSION = '1.4.0';
 
   const app = {};
   OGR.app = app;
